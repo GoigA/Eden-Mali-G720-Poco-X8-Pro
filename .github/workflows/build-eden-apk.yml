@@ -1,4 +1,4 @@
-name: Build Eden APK (Mali-G720 & Poco X8 Pro Optimized)
+name: Build Eden Mali-G720 APK (Poco X8 Pro)
 
 on:
   workflow_dispatch:
@@ -20,55 +20,38 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Install CMake 3.31+ & Build Tools
+      - name: Setup Android SDK Components
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build ccache python3-pip
-          python3 -m pip install --upgrade "cmake>=3.31.0"
-          echo "Versao do CMake instalada:"
-          cmake --version
+          echo "Instalando CMake 3.22.1 e aceitando licenças..."
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --install "cmake;3.22.1" "platforms;android-35" || true
 
-      - name: Clone Eden Latest (Nightly Mainline)
+      - name: Clone Eden Mali-G720 Source (Robert Khairislamov)
         run: |
-          echo "Clonando repositorio oficial do Eden..."
-          git clone --depth 1 --recurse-submodules --shallow-submodules https://git.eden-emu.dev/eden-emu/eden.git eden-src
+          echo "Clonando repositorio com todas as correções Mali-G720 / Immortalis..."
+          git clone --depth 1 --recurse-submodules --shallow-submodules https://github.com/robertkhairislamov-afk/eden-mali-gpu-fix-samsung-tab-s10.git eden-src
 
-      - name: Apply Robert's Mali-G720 & TBDR Fixes
-        run: |
-          cd eden-src
-          echo "Aplicando patch de remocao de travas Mali, barreiras TBDR e SMMU/nvmap..."
-          git apply --reject --whitespace=fix ../patches/0001-robert-mali-g720-tbdr.patch || patch -p1 -N -i ../patches/0001-robert-mali-g720-tbdr.patch || true
-          git status
-
-      - name: Configure CMake & NDK in Gradle
+      - name: Configure Gradle Build Settings
         run: |
           cd eden-src/src/android
           
-          # Aponta cmake.dir no local.properties para o CMake 3.31 instalado no sistema
-          CMAKE_BIN=$(which cmake)
-          CMAKE_DIR=$(dirname $(dirname $CMAKE_BIN))
-          echo "cmake.dir=$CMAKE_DIR" > local.properties
-          cat local.properties
+          # Cria local.properties apontando para o SDK
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
           
+          # Ajusta compatibilidade para SDK 35 e remove NDK version rígida para usar o NDK nativo do runner
           cd app
-          # Remove a exigencia de versao fixa de CMake do SDK para usar o CMake 3.31 do PATH/cmake.dir
-          sed -i '/version = "3.31.6"/d' build.gradle.kts
-          # Remove versao fixa do NDK para usar o NDK nativo do runner
           sed -i '/ndkVersion = /d' build.gradle.kts
-          # Ajusta compatibilidade do SDK
           sed -i 's/compileSdkVersion = "android-36"/compileSdkVersion = "android-35"/g' build.gradle.kts
           sed -i 's/targetSdk = 36/targetSdk = 35/g' build.gradle.kts
+          
+          # Garante que o CMake 3.22.1 instalado no SDK seja o utilizado
+          sed -i 's/version = "3.31.6"/version = "3.22.1"/g' build.gradle.kts
 
-      - name: Build Android APK (Poco X8 Pro - ARM64 Only)
+      - name: Build Android APK (Mainline ARM64)
         run: |
           cd eden-src/src/android
           chmod +x gradlew
-          
-          # Aceita licencas do SDK
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
-          
-          # Compila EXCLUSIVAMENTE a versao ARM64 (Mainline) para o Poco X8 Pro
-          ./gradlew :app:assembleMainlineRelWithDebInfo --no-daemon --stacktrace
+          ./gradlew :app:assembleMainlineRelease --no-daemon --stacktrace
 
       - name: Collect Generated APKs
         run: |
@@ -76,9 +59,9 @@ jobs:
           find eden-src/src/android/app/build/outputs/apk -name "*.apk" -exec cp {} output-apk/ \;
           ls -la output-apk/
 
-      - name: Upload Final APK
+      - name: Upload Final APK Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Eden-PocoX8Pro-MaliG720-Optimized
+          name: Eden-MaliG720-PocoX8Pro-Release
           path: output-apk/*.apk
           retention-days: 30
