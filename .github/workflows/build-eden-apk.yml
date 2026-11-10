@@ -8,7 +8,7 @@ on:
 jobs:
   build-apk:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
 
     steps:
       - name: Checkout Builder Repository
@@ -43,36 +43,22 @@ jobs:
           git apply --reject --whitespace=fix ../patches/0001-robert-mali-g720-tbdr.patch || patch -p1 -N -i ../patches/0001-robert-mali-g720-tbdr.patch || true
           git status
 
-      - name: Apply Poco X8 Pro & Cortex-A725 Compiler Tuning
-        run: |
-          cd eden-src
-          echo "Injetando flags de otimizacao ARMv9 Cortex-A725 no Gradle..."
-          # Ajusta flags no build.gradle do Android
-          sed -i 's/-O3/-O3 -mcpu=cortex-a725 -fvectorize/g' src/android/app/build.gradle || true
-
-      - name: Build Android APK (Mainline Release)
+      - name: Build Android APK
         run: |
           cd eden-src/src/android
           chmod +x gradlew
-          ./gradlew assembleMainlineRelease --no-daemon --stacktrace
+          # Compila a versao de release do Eden com o patch integrado
+          ./gradlew assembleRelease --no-daemon --stacktrace || ./gradlew assembleOptimizedRelease --no-daemon --stacktrace || ./gradlew assembleStandardRelease --no-daemon --stacktrace
 
-      - name: Sign APK (Debug Signing for Direct Installation)
+      - name: Collect Generated APKs
         run: |
-          cd eden-src/src/android/app/build/outputs/apk/mainline/release
-          UNSIGNED_APK=$(ls *-unsigned.apk 2>/dev/null | head -n 1 || ls *.apk | head -n 1)
-          echo "APK gerado: $UNSIGNED_APK"
-          
-          # Gera keystore temporaria para assinatura oficial do Android
-          keytool -genkey -v -keystore release.keystore -alias poco_mali -keyalg RSA -keysize 2048 -validity 10000 -storepass poco123 -keypass poco123 -dname "CN=EdenPoco, OU=MaliG720, O=PocoX8Pro, L=BR, S=BR, C=BR"
-          
-          $ANDROID_HOME/build-tools/34.0.0/apksigner sign --ks release.keystore --ks-pass pass:poco123 --key-pass pass:poco123 --out Eden-PocoX8Pro-MaliG720-Optimized.apk $UNSIGNED_APK
-          
-          mkdir -p ../../../../../../../output-apk
-          cp Eden-PocoX8Pro-MaliG720-Optimized.apk ../../../../../../../output-apk/
+          mkdir -p output-apk
+          find eden-src/src/android/app/build/outputs/apk -name "*.apk" -exec cp {} output-apk/ \;
+          ls -la output-apk/
 
       - name: Upload Final APK
         uses: actions/upload-artifact@v4
         with:
           name: Eden-PocoX8Pro-MaliG720-Optimized
-          path: output-apk/Eden-PocoX8Pro-MaliG720-Optimized.apk
+          path: output-apk/*.apk
           retention-days: 30
