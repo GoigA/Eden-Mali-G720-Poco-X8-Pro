@@ -20,16 +20,7 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Set up Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r26d
-          add-to-path: true
-
-      - name: Install System Dependencies
+      - name: Install Build Tools
         run: |
           sudo apt-get update
           sudo apt-get install -y ninja-build ccache
@@ -46,13 +37,16 @@ jobs:
           git apply --reject --whitespace=fix ../patches/0001-robert-mali-g720-tbdr.patch || patch -p1 -N -i ../patches/0001-robert-mali-g720-tbdr.patch || true
           git status
 
-      - name: Patch Gradle Build Configuration
+      - name: Configure Runner NDK & SDK in Gradle
         run: |
           cd eden-src/src/android/app
-          echo "Ajustando build.gradle.kts para compatibilidade com o runner do GitHub..."
+          # Usa o NDK nativo do runner do GitHub
+          NDK_DIR=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)
+          echo "NDK nativo encontrado no sistema: $NDK_DIR"
+          
           # Remove exigencia de versao fixa de NDK proprietario
           sed -i '/ndkVersion = /d' build.gradle.kts
-          # Ajusta versao de compilacao para Android 35 estavel
+          # Ajusta versao de compilacao para Android SDK compativel
           sed -i 's/compileSdkVersion = "android-36"/compileSdkVersion = "android-35"/g' build.gradle.kts
           sed -i 's/targetSdk = 36/targetSdk = 35/g' build.gradle.kts
 
@@ -60,8 +54,12 @@ jobs:
         run: |
           cd eden-src/src/android
           chmod +x gradlew
-          # Compila o APK do Eden usando a tarefa oficial
-          ./gradlew assembleMainlineRelWithDebInfo --stacktrace || ./gradlew assembleMainlineRelease --stacktrace || ./gradlew assembleRelease --stacktrace
+          
+          # Aceita licencas do SDK do Android se necessario
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          
+          # Executa a compilacao do APK
+          ./gradlew assembleMainlineRelWithDebInfo --no-daemon --stacktrace || ./gradlew assembleMainlineRelease --no-daemon --stacktrace || ./gradlew assembleRelease --no-daemon --stacktrace
 
       - name: Collect Generated APKs
         run: |
