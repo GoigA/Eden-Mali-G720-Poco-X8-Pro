@@ -20,6 +20,12 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
+      - name: Install System Dependencies (glslangValidator & Ninja)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y glslang-tools ninja-build ccache
+          glslangValidator --version || which glslangValidator
+
       - name: Setup Android SDK Components
         run: |
           echo "Instalando CMake 3.22.1 e aceitando licenças..."
