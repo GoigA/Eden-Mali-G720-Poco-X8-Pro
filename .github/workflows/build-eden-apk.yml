@@ -20,10 +20,13 @@ jobs:
           java-version: '17'
           distribution: 'temurin'
 
-      - name: Install Build Tools
+      - name: Install CMake 3.31+ & Build Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y ninja-build ccache
+          sudo apt-get install -y ninja-build ccache python3-pip
+          python3 -m pip install --upgrade "cmake>=3.31.0"
+          echo "Versao do CMake instalada:"
+          cmake --version
 
       - name: Clone Eden Latest (Nightly Mainline)
         run: |
@@ -37,29 +40,35 @@ jobs:
           git apply --reject --whitespace=fix ../patches/0001-robert-mali-g720-tbdr.patch || patch -p1 -N -i ../patches/0001-robert-mali-g720-tbdr.patch || true
           git status
 
-      - name: Configure Runner NDK & SDK in Gradle
+      - name: Configure CMake & NDK in Gradle
         run: |
-          cd eden-src/src/android/app
-          # Usa o NDK nativo do runner do GitHub
-          NDK_DIR=$(ls -d /usr/local/lib/android/sdk/ndk/* 2>/dev/null | sort -V | tail -n 1 || true)
-          echo "NDK nativo encontrado no sistema: $NDK_DIR"
+          cd eden-src/src/android
           
-          # Remove exigencia de versao fixa de NDK proprietario
+          # Aponta cmake.dir no local.properties para o CMake 3.31 instalado no sistema
+          CMAKE_BIN=$(which cmake)
+          CMAKE_DIR=$(dirname $(dirname $CMAKE_BIN))
+          echo "cmake.dir=$CMAKE_DIR" > local.properties
+          cat local.properties
+          
+          cd app
+          # Remove a exigencia de versao fixa de CMake do SDK para usar o CMake 3.31 do PATH/cmake.dir
+          sed -i '/version = "3.31.6"/d' build.gradle.kts
+          # Remove versao fixa do NDK para usar o NDK nativo do runner
           sed -i '/ndkVersion = /d' build.gradle.kts
-          # Ajusta versao de compilacao para Android SDK compativel
+          # Ajusta compatibilidade do SDK
           sed -i 's/compileSdkVersion = "android-36"/compileSdkVersion = "android-35"/g' build.gradle.kts
           sed -i 's/targetSdk = 36/targetSdk = 35/g' build.gradle.kts
 
-      - name: Build Android APK
+      - name: Build Android APK (Poco X8 Pro - ARM64 Only)
         run: |
           cd eden-src/src/android
           chmod +x gradlew
           
-          # Aceita licencas do SDK do Android se necessario
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+          # Aceita licencas do SDK
+          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses 2>/dev/null || true
           
-          # Executa a compilacao do APK
-          ./gradlew assembleMainlineRelWithDebInfo --no-daemon --stacktrace || ./gradlew assembleMainlineRelease --no-daemon --stacktrace || ./gradlew assembleRelease --no-daemon --stacktrace
+          # Compila EXCLUSIVAMENTE a versao ARM64 (Mainline) para o Poco X8 Pro
+          ./gradlew :app:assembleMainlineRelWithDebInfo --no-daemon --stacktrace
 
       - name: Collect Generated APKs
         run: |
