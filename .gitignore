@@ -1,0 +1,8 @@
+build/
+build_arm64/
+dist/
+*.zip
+*.so
+.ninja*
+.vscode/
+.idea/

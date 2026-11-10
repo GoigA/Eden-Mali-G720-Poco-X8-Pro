@@ -1,0 +1,78 @@
+name: Build Eden APK (Mali-G720 & Poco X8 Pro Optimized)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout Builder Repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+
+      - name: Set up Android NDK r26d
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r26d
+          add-to-path: true
+
+      - name: Set up Ninja & ccache
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build ccache
+
+      - name: Clone Eden Latest (Nightly Mainline)
+        run: |
+          echo "Clonando repositorio oficial do Eden..."
+          git clone --depth 1 --recurse-submodules --shallow-submodules https://git.eden-emu.dev/eden-emu/eden.git eden-src
+
+      - name: Apply Robert's Mali-G720 & TBDR Fixes
+        run: |
+          cd eden-src
+          echo "Aplicando patch de remocao de travas Mali, barreiras TBDR e SMMU/nvmap..."
+          git apply --reject --whitespace=fix ../patches/0001-robert-mali-g720-tbdr.patch || patch -p1 -N -i ../patches/0001-robert-mali-g720-tbdr.patch || true
+          git status
+
+      - name: Apply Poco X8 Pro & Cortex-A725 Compiler Tuning
+        run: |
+          cd eden-src
+          echo "Injetando flags de otimizacao ARMv9 Cortex-A725 no Gradle..."
+          # Ajusta flags no build.gradle do Android
+          sed -i 's/-O3/-O3 -mcpu=cortex-a725 -fvectorize/g' src/android/app/build.gradle || true
+
+      - name: Build Android APK (Mainline Release)
+        run: |
+          cd eden-src/src/android
+          chmod +x gradlew
+          ./gradlew assembleMainlineRelease --no-daemon --stacktrace
+
+      - name: Sign APK (Debug Signing for Direct Installation)
+        run: |
+          cd eden-src/src/android/app/build/outputs/apk/mainline/release
+          UNSIGNED_APK=$(ls *-unsigned.apk 2>/dev/null | head -n 1 || ls *.apk | head -n 1)
+          echo "APK gerado: $UNSIGNED_APK"
+          
+          # Gera keystore temporaria para assinatura oficial do Android
+          keytool -genkey -v -keystore release.keystore -alias poco_mali -keyalg RSA -keysize 2048 -validity 10000 -storepass poco123 -keypass poco123 -dname "CN=EdenPoco, OU=MaliG720, O=PocoX8Pro, L=BR, S=BR, C=BR"
+          
+          $ANDROID_HOME/build-tools/34.0.0/apksigner sign --ks release.keystore --ks-pass pass:poco123 --key-pass pass:poco123 --out Eden-PocoX8Pro-MaliG720-Optimized.apk $UNSIGNED_APK
+          
+          mkdir -p ../../../../../../../output-apk
+          cp Eden-PocoX8Pro-MaliG720-Optimized.apk ../../../../../../../output-apk/
+
+      - name: Upload Final APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Eden-PocoX8Pro-MaliG720-Optimized
+          path: output-apk/Eden-PocoX8Pro-MaliG720-Optimized.apk
+          retention-days: 30

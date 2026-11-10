@@ -1,0 +1,11 @@
+{
+  "schemaVersion": 1,
+  "name": "Mali-G720 TBDR Vulkan Interceptor",
+  "description": "TBDR optimizations, barrier reduction and feature fallbacks for Dimensity Mali-G720 (Poco X8 Pro)",
+  "author": "Antigravity & Marcio",
+  "packageVersion": "1.0.0",
+  "vendor": "ARM-Mali",
+  "driverVersion": "1.0.0",
+  "minApi": 29,
+  "libraryName": "libvulkan_mali_tbdr.so"
+}
